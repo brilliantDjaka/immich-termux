@@ -123,6 +123,10 @@ immich up [svc...]             start + wait for health
 immich down                    stop, reverse dependency order
 immich restart [svc...]
 immich supervise             keep the stack alive: restart dead services (Ctrl-C stops all)
+immich tunnel up|down|restart  Cloudflare Tunnel (alias of `cloudflared tunnel run`)
+immich tunnel status           tunnel state, tunnel id, edge connections, public URL
+immich tunnel token [TOKEN]    store/print the tunnel token (saved mode 600)
+immich tunnel logs [lines|-f]  cloudflared log tail
 immich status                  state, pid, uptime, port, health  (alias: ps)
 immich logs <svc> [lines|-f]   log tail
 immich shell <svc>             shell inside the service rootfs
@@ -203,6 +207,93 @@ killed underneath it.
 - **`/etc/postgresql/postgresql.conf`** is regenerated on every start (Android needs
   `shared_memory_type = mmap`); edit `immich.conf` instead of that file.
 
+## Remote access with a Cloudflare Tunnel
+
+A phone is behind carrier NAT, so nothing on it is reachable from the internet. A
+Cloudflare Tunnel solves that the only way Android allows: `cloudflared` dials **out** to
+the Cloudflare edge (QUIC/UDP 7844), so no port is opened, no root and no namespace is
+needed, and you get TLS + a real hostname for free. For Immich this is called directly on
+loopback — the same thing a reverse proxy would do.
+
+### 1. Create the tunnel (dashboard)
+
+Zero Trust → **Networks → Tunnels → Create a tunnel → Cloudflared**, name it, and copy the
+token it shows (or the whole `cloudflared service install eyJ...` command).
+
+Then add a **Public Hostname** to that tunnel:
+
+| Field | Value |
+|---|---|
+| Subdomain / Domain | e.g. `immich` + `example.com` |
+| Type | `HTTP` |
+| URL | `127.0.0.1:2283` |
+
+`127.0.0.1` is correct: cloudflared runs on the same device as Immich. Do not use
+`https://` or the LAN IP.
+
+**The DNS record must exist too.** Adding a public hostname normally creates it for you;
+if the hostname does not resolve, add it by hand in that zone's DNS page:
+
+| Type | Name | Target | Proxy |
+|---|---|---|---|
+| `CNAME` | `immich` | `<tunnel-id>.cfargotunnel.com` (your tunnel id) | **Proxied** (orange) |
+
+Without it the tunnel is connected but requests never arrive: the name is `NXDOMAIN`, or
+Cloudflare answers `530 / error code 1016` if the hostname is not attached to the tunnel.
+
+### 2. Install and start it on the phone
+
+```bash
+./immich tunnel install                              # pkg install cloudflared
+./immich tunnel token --from-file cloudflared-setup.txt   # or: tunnel token eyJ...
+./immich tunnel up
+
+./immich tunnel status
+# cloudflared    running   4711     00h00m12s  ready   4    https://immich.example.com
+#   token        : cloudflared.token
+#   tunnel id    : <tunnel-id>
+#   ingress      : (dashboard) -> http://127.0.0.1:2283
+```
+
+`ready` comes from cloudflared's own `/ready` endpoint (loopback metrics port, which also
+reports how many edge connections are up) — no dashboard round trip. If the public hostname
+is configured it is read from the tunnel log automatically; otherwise set
+`TUNNEL_HOSTNAME=immich.example.com` in `immich.conf` so `immich url` can print it.
+
+### 3. Survive reboots and Android's freezer
+
+```bash
+./immich supervise          # keeps Immich *and* the tunnel alive; Ctrl-C stops both
+termux-wake-lock            # stops Android from freezing Termux in the background
+```
+
+`immich up` does not start the tunnel by itself; `immich down` stops the tunnel together
+with the stack, while `immich restart` leaves it connected.
+
+After a reboot, Android starts nothing by itself. With the Termux:Boot app you can hand it
+the script in this repo, which starts the stack, the tunnel and then the supervisor:
+
+```bash
+mkdir -p ~/.termux/boot && cp ~/immich-termux/boot/immich.sh ~/.termux/boot/
+```
+
+### 4. Before you expose it
+
+- **Put Cloudflare Access in front of it** (Zero Trust → Access → Applications, policy
+e.g. email OTP or a GitHub org). Immich's own login is then a second layer instead of the
+only one; an Immich instance on the open internet is a documented, actively scanned target.
+- **Do not use a guessable hostname** (no `immich.<yourname>.com`), or keep Access on.
+- Set `TUNNEL_PROTOCOL=http2` in `immich.conf` if the connections flap. cloudflared prefers
+  QUIC/UDP, and many mobile carriers throttle long-lived UDP flows: on the test phone QUIC
+  kept dropping edge connections (2/4, `Retrying connection` in the log) while HTTP/2 over
+  TCP held a stable 4/4. `immich tunnel status` shows `degraded` when fewer than 4 are up.
+- Since every request reaches Immich from loopback, client IPs in Immich logs/rate limits
+  collapse to `127.0.0.1`. If you care, add `IMMICH_TRUSTED_PROXIES=127.0.0.1/32` to the
+  `immich-server` environment in `docker-compose.yaml` (the launcher picks up compose env
+  changes automatically) so `X-Forwarded-For` from cloudflared is trusted.
+- The tunnel token is an account credential: `cloudflared.token` is written mode `600` and
+  is git-ignored, and `immich tunnel token` only ever prints it masked.
+
 ## Machine learning
 
 Upstream Immich wants 6 GB RAM minimum (8 GB recommended) for the ML container; the test
@@ -254,6 +345,26 @@ half-alive, stale state can linger; `./immich down` then `./immich up` gives you
 start (cold start also clears `/dev/shm`). Keep `./immich supervise` running for
 unattended use.
 
+**`immich tunnel up` says "cloudflared is not ready"** — the token was rejected or the
+device has no route to the edge. Look at `logs/cloudflared.log`: `Provided Tunnel token is
+not valid` means a stale token (`./immich tunnel token <TOKEN>` again); repeated
+`Failed to dial to edge with quic` means UDP/7844 is blocked, so set
+`TUNNEL_PROTOCOL=http2`. Success looks like four `Registered tunnel connection` lines.
+
+**The public hostname returns 530 / error 1016 / NXDOMAIN** — the tunnel is fine but the
+DNS record is missing. See the table in the tunnel section above: a proxied `CNAME` to
+`<tunnel-id>.cfargotunnel.com`. `1016` specifically means "this hostname is not attached to
+the tunnel", i.e. the ingress rule and the DNS record disagree.
+
+**Cloudflare Tunnel + Immich specifics** — every request arrives from `127.0.0.1`, so
+Immich sees one client. If you want real client IPs in logs and rate limiting, add
+`IMMICH_TRUSTED_PROXIES=127.0.0.1/32` to the `immich-server` environment in
+`docker-compose.yaml`. Large uploads are limited by Cloudflare's 100 MB free-plan request
+body limit — Immich's resumable uploads work, but single-shot uploads above that size fail.
+
+**Logs grow forever** — `logs/<service>.log` and `logs/cloudflared.log` are rotated to
+`*.log.1` once they pass `LOG_MAX_MB` (default 20 MB).
+
 **Everything is UTC** — `pip install tzdata`, then `./immich install` again (or
 `python3 lib/tzsetup.py --root . --tz Asia/Jakarta`).
 
@@ -280,6 +391,8 @@ rootfs/<service>/       extracted image filesystem (one per service)
 volumes/<name>/         compose named volumes (e.g. model-cache)
 cache/blobs/            downloaded, digest-verified layers
 logs/<service>.log      service stdout/stderr
+logs/cloudflared.log    tunnel log (the token is passed as an argument, never logged)
+boot/immich.sh          example ~/.termux/boot/ entry: up + tunnel + supervise
 ```
 
 ## Licence

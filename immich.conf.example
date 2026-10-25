@@ -42,6 +42,24 @@ SHM_COMPAT=1
 # Seconds to wait for a service to become healthy during `immich up`.
 HEALTH_TIMEOUT=180
 
+# --- Cloudflare Tunnel (expose Immich to the internet without opening a port) ---------
+# The tunnel itself is created in the Cloudflare dashboard; it is identified by a token.
+# Prefer saving the token once with:  ./immich tunnel token <TOKEN>
+# (writes cloudflared.token, mode 600). Setting it here also works.
+#TUNNEL_TOKEN=
+
+# Public hostname you configured in the dashboard. Only used to print URLs -- it is also
+# recovered automatically from the tunnel log when left empty.
+#TUNNEL_HOSTNAME=immich.example.com
+
+# quic (cloudflared default, UDP/7844) or http2 (TCP/443). QUIC is faster, but many
+# mobile carriers throttle UDP: if `immich tunnel status` shows `degraded`, use http2.
+# On the test device http2 held all 4 edge connections where quic kept reconnecting.
+#TUNNEL_PROTOCOL=http2
+
+# Loopback port for cloudflared's metrics/health endpoint (`immich tunnel status`).
+#TUNNEL_METRICS_PORT=20241
+
 # Override if proot lives somewhere unusual.
 # PROOT_BIN=proot
 

@@ -18,6 +18,7 @@ if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
 #   restart [svc...]
 #   status                table of services
 #   supervise             keep the stack running (restarts dead services)
+#   tunnel [up|down|status|token|logs]  Cloudflare Tunnel (cloudflared) for remote access
 #   logs <svc> [lines]    show log; `-f` follows
 #   shell <svc>           interactive shell in the service rootfs
 #   exec <svc> -- cmd...  run a command inside the service rootfs
@@ -48,6 +49,16 @@ fi
 : "${TZ:=}"
 : "${PG_LOW_MEM:=1}"
 : "${HEALTH_TIMEOUT:=180}"
+
+# Cloudflare Tunnel: the tunnel is created in the Cloudflare dashboard and identified
+# by a token, so no cert.pem / config.yml is needed here.
+: "${TUNNEL_HOSTNAME:=}"       # public hostname from the dashboard (only used to print URLs)
+: "${TUNNEL_PROTOCOL:=}"       # quic (cloudflared default) or http2 if UDP is blocked
+: "${TUNNEL_METRICS_PORT:=20241}"
+
+TUNNEL_TOKEN_FILE="$ROOT/cloudflared.token"
+TUNNEL_PID="$ROOT/run/cloudflared.pid"
+TUNNEL_LOG="$ROOT/logs/cloudflared.log"
 
 export IMMICH_TERMUX_ROOT="$ROOT"
 
@@ -218,6 +229,11 @@ s=json.load(open(sys.argv[1]));print(s["services"].get("immich-server",{}).get("
   info "Start the stack:   ./immich up"
   info "Show status:       ./immich status"
   info "Web UI:            http://127.0.0.1:$(svc_port immich-server 2>/dev/null || echo 2283)"
+  if command -v cloudflared >/dev/null 2>&1 || [ -f "$ROOT/cloudflared-setup.txt" ]; then
+    info "Remote access:     ./immich tunnel token --from-file cloudflared-setup.txt && ./immich tunnel up"
+  else
+    info "Remote access:     ./immich tunnel install && ./immich tunnel up  (Cloudflare Tunnel)"
+  fi
   info ""
   warn "Android may freeze Termux in the background. Run 'termux-wake-lock' (termux-api)"
   warn "and disable battery optimisation for Termux, otherwise the stack will be paused."
@@ -309,15 +325,26 @@ cmd_up() {
   local url
   url="$(cmd_url immich-server 2>/dev/null || true)"
   [ -n "$url" ] && info "Web UI: $url"
+  if tunnel_running; then
+    local pub; pub="$(tunnel_public_url)"
+    [ -n "$pub" ] && info "Public: $pub"
+  fi
 }
 
 cmd_down() {
   require_python
-  local svc list
+  local keep_tunnel=0 arg svc list
+  for arg in "$@"; do
+    [ "$arg" = "--keep-tunnel" ] && keep_tunnel=1
+  done
   list="$(service_list 2>/dev/null | tac)"
   for svc in $list; do
     "$PY" "$ROOT/lib/svc.py" --root "$ROOT" stop "$svc" >/dev/null
   done
+  # the tunnel exists to expose this stack, so it goes down with it (`restart` keeps it)
+  if [ "$keep_tunnel" = 0 ] && [ -f "$TUNNEL_PID" ]; then
+    cmd_tunnel_down
+  fi
   ok "stopped"
 }
 
@@ -329,7 +356,7 @@ cmd_restart() {
       "$PY" "$ROOT/lib/svc.py" --root "$ROOT" stop "$svc" >/dev/null
     done
   else
-    cmd_down
+    cmd_down --keep-tunnel
   fi
   cmd_up "$@"
 }
@@ -338,8 +365,11 @@ cmd_supervise() {
   require_python
   ensure_plan || return 1
   local interval="${SUPERVISE_INTERVAL:-10}" svc state pid uptime
+  # the tunnel is supervised too, but only if it was up when the supervisor started
+  local tunnel_wanted=0
+  [ -f "$TUNNEL_PID" ] && tunnel_wanted=1
   trap 'info ""; info "stopping supervisor"; cmd_down; exit 0' INT TERM
-  info "supervising the stack (interval ${interval}s, Ctrl-C to stop)"
+  info "supervising the stack${tunnel_wanted:+ and the tunnel} (interval ${interval}s, Ctrl-C to stop)"
   while :; do
     for svc in $(enabled_services); do
       read -r state pid uptime <<<"$(svc_state "$svc")"
@@ -349,8 +379,307 @@ cmd_supervise() {
           && dim "    $svc restarted" || warn "    $svc restart failed"
       fi
     done
+    if [ "$tunnel_wanted" = 1 ] && ! tunnel_running; then
+      warn "cloudflared is not running -- restarting"
+      cmd_tunnel_up >/dev/null 2>&1 && dim "    cloudflared restarted" \
+        || warn "    cloudflared restart failed (see logs/cloudflared.log)"
+    fi
     sleep "$interval"
   done
+}
+
+# ------------------------------------------------------------------ cloudflared
+#
+# `cloudflared` is a single static Go binary that dials *out* to the Cloudflare edge, so
+# nothing has to be reachable from the internet and no firewall port is opened -- which is
+# what makes it work on an unrooted phone. `cloudflared service install` only exists for
+# systemd, so here it is a plain background process with a pid file, like the services.
+
+tunnel_installed() { command -v cloudflared >/dev/null 2>&1; }
+
+# cloudflared only ever appends; keep one generation so the log cannot fill the phone
+rotate_log() {
+  local f="$1" max_mb="${LOG_MAX_MB:-20}" size
+  [ -f "$f" ] || return 0
+  size="$(wc -c < "$f" 2>/dev/null || echo 0)"
+  [ "${size:-0}" -gt $(( max_mb * 1024 * 1024 )) ] || return 0
+  mv -f "$f" "$f.1" && dim "rotated $(basename "$f") (was $(( size / 1048576 )) MB)"
+}
+
+tunnel_token_source() {
+  if [ -n "${TUNNEL_TOKEN:-}" ]; then printf 'immich.conf (TUNNEL_TOKEN)'
+  elif [ -f "$TUNNEL_TOKEN_FILE" ]; then printf '%s' "${TUNNEL_TOKEN_FILE#$ROOT/}"
+  elif [ -f "$ROOT/cloudflared-setup.txt" ]; then printf 'cloudflared-setup.txt'
+  else printf 'not configured'
+  fi
+}
+
+tunnel_token() {
+  local tok="${TUNNEL_TOKEN:-}" f
+  if [ -z "$tok" ] && [ -f "$TUNNEL_TOKEN_FILE" ]; then
+    tok="$(tr -d '[:space:]' < "$TUNNEL_TOKEN_FILE")"
+  fi
+  if [ -z "$tok" ]; then
+    for f in "$ROOT/cloudflared-setup.txt" "$ROOT/cloudflared-token.txt"; do
+      [ -f "$f" ] || continue
+      tok="$(grep -oE '[A-Za-z0-9_-]{100,}' "$f" | head -1)"
+      [ -n "$tok" ] && break
+    done
+  fi
+  [ -n "$tok" ] || return 1
+  printf '%s' "$tok"
+}
+
+# a tunnel token is base64(JSON) of {account tag, tunnel id, secret}: show only the
+# identifiers, never the secret
+TUNNEL_IDS_PY='import base64,json,sys
+tok=sys.argv[1]
+try:
+    d=json.loads(base64.urlsafe_b64decode(tok + "=" * (-len(tok) % 4)))
+    print(d.get("t", "?"), d.get("a", "?"))
+except Exception:
+    print("? ?")'
+
+tunnel_ids() { "$PY" -c "$TUNNEL_IDS_PY" "$1" 2>/dev/null || printf '? ?'; }
+
+tunnel_pid() {
+  [ -f "$TUNNEL_PID" ] || return 1
+  local pid
+  read -r pid _ < "$TUNNEL_PID" || return 1
+  [ -n "$pid" ] && [ -d "/proc/$pid" ] || return 1
+  printf '%s' "$pid"
+}
+
+tunnel_running() { tunnel_pid >/dev/null 2>&1; }
+
+tunnel_uptime_s() {
+  local pid start
+  read -r pid start < "$TUNNEL_PID" 2>/dev/null || return 0
+  [ -n "${start:-}" ] || return 0
+  printf '%s' $(( $(date +%s) - start ))
+}
+
+# cloudflared serves a metrics server on loopback; /ready answers 200 once at least one
+# connection to the edge is up (503 otherwise) and reports how many there are.
+tunnel_ready() {
+  "$PY" "$ROOT/lib/probe.py" http "http://127.0.0.1:$TUNNEL_METRICS_PORT/ready" \
+      --expect 200 --timeout 3 >/dev/null 2>&1
+}
+
+tunnel_connections() {
+  curl -sS --max-time 3 "http://127.0.0.1:$TUNNEL_METRICS_PORT/ready" 2>/dev/null |
+    "$PY" -c 'import json,sys
+try: print(json.load(sys.stdin).get("readyConnections", 0))
+except Exception: pass'
+}
+
+tunnel_hostname() {
+  local host="$TUNNEL_HOSTNAME"
+  # a dashboard-managed tunnel logs its ingress on every reconnect, so the public
+  # hostname can be recovered without asking the Cloudflare API. In the log the config
+  # is printed as an escaped JSON string (config="{\"ingress\":[{\"hostname\"...).
+  if [ -z "$host" ] && [ -f "$TUNNEL_LOG" ]; then
+    host="$("$PY" - "$TUNNEL_LOG" <<'PY'
+import re, sys
+try:
+    with open(sys.argv[1], errors='replace') as fh:
+        text = fh.read().replace('\\"', '"')
+except OSError:
+    raise SystemExit
+hosts = re.findall(r'"hostname"\s*:\s*"([^"]+)"', text)
+print(hosts[-1] if hosts else '', end='')
+PY
+)"
+  fi
+  printf '%s' "$host"
+}
+
+tunnel_public_url() {
+  local host; host="$(tunnel_hostname)"
+  [ -n "$host" ] && printf 'https://%s\n' "$host"
+}
+
+# what the dashboard public hostname must point at: the Immich server on loopback
+tunnel_service_target() { printf 'http://127.0.0.1:%s\n' "$(svc_port immich-server 2>/dev/null || echo 2283)"; }
+
+cmd_tunnel_install() {
+  if tunnel_installed; then
+    dim "cloudflared present: $(cloudflared --version 2>&1 | head -1)"
+    return 0
+  fi
+  info "==> pkg install cloudflared"
+  pkg install -y cloudflared || { err "pkg install cloudflared failed"; return 1; }
+  ok "    $(cloudflared --version 2>&1 | head -1)"
+}
+
+cmd_tunnel_token() {
+  local arg="${1:-}" tok
+  if [ -z "$arg" ]; then
+    tok="$(tunnel_token)" || { info "no tunnel token configured"; return 1; }
+    local tid aid; read -r tid aid <<<"$(tunnel_ids "$tok")"
+    info "token source : $(tunnel_token_source)"
+    info "masked       : ${tok:0:10}...${tok: -6} (${#tok} chars)"
+    info "tunnel id    : $tid"
+    info "account id   : $aid"
+    return 0
+  fi
+  if [ "$arg" = "--from-file" ]; then
+    local f="${2:-}"
+    [ -f "$f" ] || { err "no such file: $f"; return 1; }
+    tok="$(grep -oE '[A-Za-z0-9_-]{100,}' "$f" | head -1)"
+    [ -n "$tok" ] || { err "no tunnel token found in $f"; return 1; }
+  else
+    case "$arg" in
+      *[!A-Za-z0-9_-]*) err "that does not look like a tunnel token (base64url only)"; return 1 ;;
+    esac
+    [ "${#arg}" -ge 100 ] || { err "token looks too short (${#arg} chars)"; return 1; }
+    tok="$arg"
+  fi
+  mkdir -p "$ROOT/run"
+  printf '%s\n' "$tok" > "$TUNNEL_TOKEN_FILE"
+  chmod 600 "$TUNNEL_TOKEN_FILE"
+  ok "saved $TUNNEL_TOKEN_FILE (mode 600)"
+  info "Start it with:  ./immich tunnel up"
+}
+
+cmd_tunnel_up() {
+  require_python
+  tunnel_installed || {
+    err "cloudflared is not installed -- run: pkg install cloudflared"
+    return 1
+  }
+  local tok; tok="$(tunnel_token)" || {
+    err "no Cloudflare tunnel token"
+    dim "    ./immich tunnel token <TOKEN>          # or --from-file cloudflared-setup.txt"
+    return 1
+  }
+  mkdir -p "$ROOT/run" "$ROOT/logs"
+  if tunnel_running; then
+    info "cloudflared: already running (pid $(tunnel_pid))"
+  else
+    rotate_log "$TUNNEL_LOG"
+    # --no-autoupdate/--metrics are `tunnel`-level flags, so they must precede `run`
+    local args=(tunnel --no-autoupdate --metrics "127.0.0.1:$TUNNEL_METRICS_PORT" run --token "$tok")
+    [ -n "$TUNNEL_PROTOCOL" ] && args+=(--protocol "$TUNNEL_PROTOCOL")
+    # termux-exec exports LD_PRELOAD; children of cloudflared must not inherit it
+    env -u LD_PRELOAD nohup cloudflared "${args[@]}" >>"$TUNNEL_LOG" 2>&1 &
+    local pid=$!
+    printf '%s %s\n' "$pid" "$(date +%s)" > "$TUNNEL_PID"
+    info "cloudflared: started (pid $pid)"
+  fi
+
+  local i
+  for i in $(seq 1 30); do
+    tunnel_ready && break
+    [ -d "/proc/$(tunnel_pid 2>/dev/null)" ] || break
+    sleep 1
+  done
+  if ! tunnel_ready; then
+    err "cloudflared is not ready (no connection to the Cloudflare edge)"
+    dim "    last log lines from logs/cloudflared.log:"
+    tail -n 15 "$TUNNEL_LOG" 2>/dev/null | sed 's/^/    /'
+    return 1
+  fi
+  # connections come up one by one; give the remaining ones a moment so the report is real
+  local conn i2
+  for i2 in $(seq 1 10); do
+    conn="$(tunnel_connections)"; conn="${conn:-0}"
+    [ "$conn" -ge 4 ] 2>/dev/null && break
+    sleep 1
+  done
+  ok "    tunnel ready (${conn:-?} edge connection(s))"
+  if [ "${conn:-0}" -lt 4 ] 2>/dev/null; then
+    dim "    fewer than 4 connections: cloudflared likes QUIC/UDP, but carrier NAT often"
+    dim "    throttles it -- set TUNNEL_PROTOCOL=http2 in immich.conf if this flaps"
+  fi
+
+  local url; url="$(tunnel_public_url)"
+  if [ -n "$url" ]; then
+    info "Public URL: $url"
+  else
+    warn "no public hostname known yet:"
+    dim "    in the dashboard add a public hostname (e.g. immich.example.com, type HTTP)"
+    dim "    pointing at $(tunnel_service_target)  -- then set TUNNEL_HOSTNAME in immich.conf"
+  fi
+}
+
+cmd_tunnel_down() {
+  local pid
+  if ! pid="$(tunnel_pid)"; then
+    rm -f "$TUNNEL_PID"
+    info "cloudflared: not running"
+    return 0
+  fi
+  kill -TERM "$pid" 2>/dev/null
+  local i
+  for i in $(seq 1 20); do
+    [ -d "/proc/$pid" ] || break
+    sleep 0.5
+  done
+  if [ -d "/proc/$pid" ]; then
+    kill -KILL "$pid" 2>/dev/null
+    sleep 0.5
+  fi
+  rm -f "$TUNNEL_PID"
+  ok "cloudflared stopped"
+}
+
+cmd_tunnel_status() {
+  local pid state uptime ready conns url
+  if pid="$(tunnel_pid)"; then
+    state="${C_GRN}running${C_OFF}"
+    uptime="$(human_uptime "$(tunnel_uptime_s)")"
+    conns="$(tunnel_connections)"; conns="${conns:-0}"
+    # cloudflared keeps 4 connections to different edge locations; fewer means flapping
+    if ! tunnel_ready; then
+      ready="${C_RED}dead${C_OFF}"
+    elif [ "$conns" -lt 4 ] 2>/dev/null; then
+      ready="${C_YEL}degraded${C_OFF}"
+    else
+      ready="${C_GRN}ready${C_OFF}"
+    fi
+  else
+    state=stopped; pid='-'; uptime='-'; ready='-'; conns='-'
+  fi
+  url="$(tunnel_public_url)"
+  printf '%-22s %-9b %-8s %-10s %-10b %-4s %s\n' cloudflared "$state" "$pid" "$uptime" "$ready" "$conns" "${url:--}"
+
+  local tok tid aid
+  if tok="$(tunnel_token)"; then
+    read -r tid aid <<<"$(tunnel_ids "$tok")"
+    dim "  token        : $(tunnel_token_source)"
+    dim "  tunnel id    : $tid"
+    dim "  account id   : $aid"
+    dim "  ingress      : (dashboard) -> $(tunnel_service_target)"
+  else
+    dim "  token        : none -- ./immich tunnel token <TOKEN>"
+  fi
+  if [ "$state" != stopped ] && [ "${conns:-0}" -lt 4 ] 2>/dev/null; then
+    dim "  tip          : connections are flapping; on mobile networks UDP is often"
+    dim "                 throttled -- set TUNNEL_PROTOCOL=http2 in immich.conf"
+  fi
+}
+
+cmd_tunnel_logs() {
+  local lines="${1:-40}"
+  [ -f "$TUNNEL_LOG" ] || { err "no log yet ($TUNNEL_LOG)"; return 1; }
+  if [ "$lines" = "-f" ]; then tail -n 40 -f "$TUNNEL_LOG"; else tail -n "$lines" "$TUNNEL_LOG"; fi
+}
+
+cmd_tunnel() {
+  local sub="${1:-status}"
+  shift 2>/dev/null || true
+  case "$sub" in
+    up|start)       cmd_tunnel_up "$@" ;;
+    down|stop)      cmd_tunnel_down "$@" ;;
+    restart)        cmd_tunnel_down >/dev/null; cmd_tunnel_up "$@" ;;
+    status|ps)      cmd_tunnel_status "$@" ;;
+    logs)           cmd_tunnel_logs "$@" ;;
+    token)          cmd_tunnel_token "$@" ;;
+    install)        cmd_tunnel_install "$@" ;;
+    help|-h|--help) usage ;;
+    *) err "unknown tunnel command: $sub"; dim "    up | down | restart | status | logs | token | install"; return 1 ;;
+  esac
 }
 
 svc_state() {
@@ -392,6 +721,17 @@ cmd_status() {
     fi
     printf '%-22s %-9b %-8s %-10s %-7s %-6b %s\n' "$svc" "$mark" "${pid:--}" "$uptime" "${port:--}" "$health" "$image"
   done
+
+  local conn pub
+  if tunnel_running; then
+    conn="$(tunnel_connections)"; conn="${conn:-0}"
+    pub="$(tunnel_public_url)"
+    info ""
+    info "${C_GRN}tunnel${C_OFF} cloudflared pid $(tunnel_pid), ${conn} edge connection(s)${pub:+ -> $pub}"
+  elif tunnel_installed; then
+    info ""
+    dim "tunnel stopped (./immich tunnel up)"
+  fi
 }
 
 cmd_logs() {
@@ -436,6 +776,14 @@ cmd_url() {
   else
     printf 'http://%s:%s\n' "$host" "$port"
   fi
+  # `immich url` is the quickest way to find out where the stack can be reached; the
+  # public URL is only printed while the tunnel is actually connected
+  local pub
+  if tunnel_running; then
+    pub="$(tunnel_public_url)"
+    [ -n "$pub" ] && printf '%s\n' "$pub"
+  fi
+  return 0
 }
 
 ip_guess() {
@@ -509,6 +857,35 @@ except Exception: print("")' "$rootfs/.immich-image.json" 2>/dev/null || true)"
   done
 
   info ""
+  info "== tunnel (cloudflared) =="
+  if tunnel_installed; then
+    dim "  binary       : $(cloudflared --version 2>&1 | head -1)"
+  elif command -v pkg >/dev/null 2>&1; then
+    dim "  binary       : not installed (pkg install cloudflared)"
+  else
+    dim "  binary       : not installed"
+  fi
+  if tunnel_token >/dev/null 2>&1; then
+    local tid aid
+    read -r tid aid <<<"$(tunnel_ids "$(tunnel_token)")"
+    dim "  token        : $(tunnel_token_source)"
+    dim "  tunnel id    : $tid"
+  else
+    dim "  token        : none -- ./immich tunnel token <TOKEN>"
+  fi
+  if tunnel_running; then
+    local conn
+    conn="$(tunnel_connections)"; conn="${conn:-0}"
+    dim "  state        : running (pid $(tunnel_pid), ${conn} edge connection(s))"
+    dim "  ready probe  : 127.0.0.1:$TUNNEL_METRICS_PORT/ready $(tunnel_ready && echo ok || echo fail)"
+  else
+    dim "  state        : stopped"
+  fi
+  local pub; pub="$(tunnel_public_url)"
+  dim "  public url   : ${pub:-unknown (set TUNNEL_HOSTNAME in immich.conf)}"
+  dim "  ingress      : dashboard -> $(tunnel_service_target)"
+
+  info ""
   info "== settings =="
   dim "  root         : $ROOT"
   dim "  compose      : $COMPOSE"
@@ -545,6 +922,7 @@ case "${1:-help}" in
   env)      shift; cmd_env "$@" ;;
   url)      shift; cmd_url "$@" ;;
   doctor)   shift; cmd_doctor "$@" ;;
+  tunnel)   shift; cmd_tunnel "$@" ;;
   prune)    shift; cmd_prune "$@" ;;
   version|--version) cmd_version ;;
   help|-h|--help) usage ;;

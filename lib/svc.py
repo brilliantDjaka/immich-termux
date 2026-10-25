@@ -597,6 +597,27 @@ def read_pid(root, name):
     return data
 
 
+def rotate_log(path, max_mb=None):
+    """Keep logs/<service>.log from growing without bound (one generation is kept)."""
+    if max_mb is None:
+        try:
+            max_mb = float(os.environ.get('LOG_MAX_MB') or 20)
+        except ValueError:
+            max_mb = 20
+    if max_mb <= 0 or not os.path.exists(path):
+        return False
+    try:
+        if os.path.getsize(path) <= max_mb * 1024 * 1024:
+            return False
+    except OSError:
+        return False
+    try:
+        os.replace(path, path + '.1')
+        return True
+    except OSError:
+        return False
+
+
 def cmd_start(root, name, spec, conf, wait_start=2.0):
     existing = read_pid(root, name)
     if existing:
@@ -606,6 +627,8 @@ def cmd_start(root, name, spec, conf, wait_start=2.0):
     os.makedirs(os.path.join(root, 'logs'), exist_ok=True)
     os.makedirs(os.path.join(root, 'run'), exist_ok=True)
     logpath = logfile(root, name)
+    if rotate_log(logpath):
+        print('%s: rotated log to %s.1' % (name, os.path.basename(logpath)))
     with open(logpath, 'ab') as logfh:
         logfh.write(('\n=== %s  start %s  cmd=%s ===\n' % (time.strftime('%Y-%m-%d %H:%M:%S'), name, ' '.join(argv))).encode())
         logfh.flush()

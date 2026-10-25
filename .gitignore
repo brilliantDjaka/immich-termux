@@ -12,6 +12,10 @@ tmp/
 plan.json
 # local configuration (may contain your own overrides)
 immich.conf
+# Cloudflare Tunnel credentials -- secrets, never commit these
+cloudflared.token
+cloudflared-setup.txt
+cloudflared-token.txt
 # shm shim build output (the aarch64 binary is committed under lib/prebuilt/)
 shm/libshm-compat.so
 shm/shm_test
