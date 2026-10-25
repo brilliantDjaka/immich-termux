@@ -104,14 +104,14 @@ cd ~ && git clone <this repo> immich-termux && cd immich-termux
 4. build the SysV shim if `clang` is available, otherwise use the bundled aarch64 build,
 5. install the `tzdata` wheel and copy real TZif files into each rootfs.
 
-Then keep it alive — Android freezes background apps:
+Then keep it alive — Android freezes background apps and starts nothing by itself:
 
 ```bash
-pkg install termux-api      # then, once per boot:
-termux-wake-lock
+./immich service install    # runit (termux-services) service: autostart + auto-restart
 ```
 
-and disable battery optimisation for Termux in Android settings.
+plus `termux-wake-lock` and battery-optimisation exemption for Termux (see
+[Autostart](#3b-autostart-surviving-reboots-and-androids-freezer)).
 
 ## Commands
 
@@ -122,7 +122,8 @@ immich pull [svc...] [--force] pull/extract images (no docker)
 immich up [svc...]             start + wait for health
 immich down                    stop, reverse dependency order
 immich restart [svc...]
-immich supervise             keep the stack alive: restart dead services (Ctrl-C stops all)
+immich supervise               keep the stack alive: restart dead services (Ctrl-C stops all)
+immich service install|uninstall|status   runit autostart service (survives reboot)
 immich tunnel up|down|restart  Cloudflare Tunnel (alias of `cloudflared tunnel run`)
 immich tunnel status           tunnel state, tunnel id, edge connections, public URL
 immich tunnel token [TOKEN]    store/print the tunnel token (saved mode 600)
@@ -190,10 +191,11 @@ killed underneath it.
 - **Isolation is emulated, not real.** One namespace, one UID mapping. Any port in the
   compose file is really bound on the device; `8080:2283` is honoured by setting
   `IMMICH_PORT=8080`, but published ports for databases/caches cannot be remapped.
-- **`restart: always` is not a supervisor.** Nothing restarts after a reboot: run
-  `./immich up`, or keep a supervisor in the foreground with `./immich supervise`
-  (it restarts dead services; `Ctrl-C` stops the whole stack), and/or wire `up` into
-  `~/.termux/boot/`.
+- **`restart: always` is not a supervisor.** Nothing restarts after a reboot unless the
+  runit service is installed (`./immich service install`, see
+  [Autostart](#3b-autostart-surviving-reboots-and-androids-freezer)); that service runs
+  `immich supervise`, which restarts dead services and, on a cold start, brings the stack
+  up in dependency order before it starts watching.
 - **`/dev/shm` is a directory, not tmpfs.** A container always gets a fresh tmpfs;
   here it is `volumes/shm` and it survives restarts, so a cold `immich up` empties it
   (PostgreSQL keeps its dynamic shared memory control segment there and reusing a stale
@@ -270,12 +272,63 @@ termux-wake-lock            # stops Android from freezing Termux in the backgrou
 `immich up` does not start the tunnel by itself; `immich down` stops the tunnel together
 with the stack, while `immich restart` leaves it connected.
 
-After a reboot, Android starts nothing by itself. With the Termux:Boot app you can hand it
-the script in this repo, which starts the stack, the tunnel and then the supervisor:
+`supervise` is a foreground process, so it is only useful in an interactive session. For
+unattended operation register it with **runit** (`termux-services`), which Termux already
+uses for `sshd`:
 
 ```bash
-mkdir -p ~/.termux/boot && cp ~/immich-termux/boot/immich.sh ~/.termux/boot/
+pkg install termux-services   # provides sv, svlogd, sv-enable
+./immich service install      # writes $PREFIX/var/service/immich/{run,log/run}
+sv up immich                  # or just reboot: runsvdir picks it up automatically
+sv status immich
 ```
+
+The generated run script sets `SUPERVISE_STOP_STACK=0`, so `sv restart immich` (runsv
+kills the supervisor and starts a new one) leaves the stack running. Consequences:
+
+- `./immich down` is undone within `SUPERVISE_INTERVAL` (10 s) while the service is up.
+  To really stop everything: `sv down immich && ./immich down`.
+- On a cold start the supervisor runs `immich up` (dependency order + health gates)
+  instead of the 10 s restart loop, so Postgres is listening before the API starts.
+- Supervisor output goes to `$PREFIX/var/log/immich/current` (svlogd, ~1 MB × 10).
+
+### 3b. Autostart: surviving reboots and Android's freezer
+
+After a reboot Android starts nothing by itself. Two pieces are needed:
+
+1. **runsvdir must be running.** Termux normally starts it from
+   `$PREFIX/etc/profile.d/start-services.sh`, i.e. only when a shell opens. The boot
+   script below starts it explicitly.
+2. **Something must trigger a script at boot.** That is the **Termux:Boot** app
+   (`com.termux.boot`, F-Droid — not the Play Store build). Install it, **open it once**,
+   and allow external command execution in `~/.termux/termux.properties`:
+
+```properties
+allow-external-apps = true
+```
+
+```bash
+git clone <this repo> ~/immich-termux && cd ~/immich-termux
+./immich service install
+mkdir -p ~/.termux/boot && cp boot/immich.sh ~/.termux/boot/ && chmod +x ~/.termux/boot/immich.sh
+```
+
+`~/.termux/boot/immich.sh` does **not** run the supervisor itself (a foreground process
+started by Termux:Boot dies with that app, and its TERM trap used to tear the whole stack
+down). It takes the wake lock, starts `runsvdir` if needed and does `sv up immich`, then
+exits — the supervisor lives under runsv, which survives screen-off and restarts it.
+
+Finally, keep Android from killing Termux:
+
+```bash
+termux-wake-lock            # one wakelock; the run script takes it again every boot
+```
+
+and exempt Termux **and** Termux:Boot from battery optimisation. On EMUI/Huawei (no
+standard battery-optimisation screen) that is Settings → Battery → **App launch** →
+Termux / Termux:Boot → *Manage manually*, with auto-launch, secondary launch and
+run-in-background all enabled — otherwise PowerGenie kills the stack minutes after the
+screen goes off.
 
 ### 4. Before you expose it
 
@@ -342,8 +395,8 @@ If it is missing, build it: `cd shm && clang -shared -fPIC -nostdlib -nodefaultl
 **The database disappears after a while** — check `logs/database.log` for
 `terminated with signal`. If you restarted the stack while a previous Postgres was still
 half-alive, stale state can linger; `./immich down` then `./immich up` gives you a clean
-start (cold start also clears `/dev/shm`). Keep `./immich supervise` running for
-unattended use.
+start (cold start also clears `/dev/shm`). With `./immich service install` the runit
+service restarts it for you; without it, keep `./immich supervise` running.
 
 **`immich tunnel up` says "cloudflared is not ready"** — the token was rejected or the
 device has no route to the edge. Look at `logs/cloudflared.log`: `Provided Tunnel token is
@@ -369,7 +422,28 @@ body limit — Immich's resumable uploads work, but single-shot uploads above th
 `python3 lib/tzsetup.py --root . --tz Asia/Jakarta`).
 
 **The stack stops when the screen sleeps** — `termux-wake-lock` and exempt Termux from
-battery optimisation.
+battery optimisation. With the runit service installed (`./immich service install`) the
+wake lock is re-taken on every boot by the service's run script.
+
+**`<service> restart failed` over and over, `bind: Address already in use` in the log** —
+a proot that was SIGKILLed (OOM killer, a frozen Termux, `kill -9`) cannot forward the
+signal to its tracees, so the old process keeps the port. `svc.py` cleans the session the
+dead proot led before every start (session ids are unique per boot, so this is safe); if
+you hit it with an older build, kill the leftover by hand:
+
+```bash
+ps -ef | grep -E 'valkey|postgres' | grep -v grep   # look for ppid 1
+kill -9 <pid>
+```
+
+**`./immich down` does not stay down** — the runit service is supervising: it restarts the
+stack within `SUPERVISE_INTERVAL` (10 s). Use `sv down immich && ./immich down`.
+
+**Nothing starts after a reboot** — check, in this order: Termux:Boot installed *and
+opened once*; `allow-external-apps = true` in `~/.termux/termux.properties` (then
+`termux-reload-settings`); `./immich service install` has been run (`ls
+$PREFIX/var/service/immich`); `logs/boot.log` for what the boot script saw; and the
+vendor's app-launch/battery settings (EMUI *PowerGenie* kills Termux otherwise).
 
 ## Repository layout
 
@@ -392,7 +466,7 @@ volumes/<name>/         compose named volumes (e.g. model-cache)
 cache/blobs/            downloaded, digest-verified layers
 logs/<service>.log      service stdout/stderr
 logs/cloudflared.log    tunnel log (the token is passed as an argument, never logged)
-boot/immich.sh          example ~/.termux/boot/ entry: up + tunnel + supervise
+boot/immich.sh          Termux:Boot entry: wake lock + runsvdir + `sv up immich` (no supervisor)
 ```
 
 ## Licence

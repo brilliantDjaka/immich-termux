@@ -563,6 +563,56 @@ def kill_orphans(spec, timeout=5.0):
     return pids
 
 
+def session_members(sid):
+    """Every process still attached to the session led by `sid`.
+
+    svc.py starts each service with setsid(), so proot's pid *is* the session id and all
+    of its tracees inherit it. That is the only reliable handle on them afterwards: proot
+    cannot forward a SIGKILL, so after `kill -9 <proot>` (OOM killer, a frozen Termux) the
+    tracees survive with their port still bound, and their own argv no longer mentions the
+    rootfs (valkey rewrites it to `valkey-server *:6379`). Session ids are unique per boot,
+    so this can never match an unrelated process.
+    """
+    found = []
+    for entry in os.listdir('/proc'):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            if os.getsid(pid) == sid:
+                found.append(pid)
+        except OSError:
+            continue
+    return found
+
+def kill_session(sid, timeout=5.0):
+    """SIGTERM, then SIGKILL, everything left in the session led by `sid`."""
+    victims = session_members(sid)
+    if not victims:
+        return []
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in victims:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+        deadline = time.time() + (timeout if sig == signal.SIGTERM else 0)
+        while time.time() < deadline and any(os.path.isdir('/proc/%d' % p) for p in victims):
+            time.sleep(0.2)
+        if not any(os.path.isdir('/proc/%d' % p) for p in victims):
+            break
+        time.sleep(0.3)
+    return victims
+
+def recorded_pid(root, name):
+    """The pid stored in the pid file, whether or not it is still alive."""
+    try:
+        with open(pidfile(root, name), 'r', encoding='utf-8') as fh:
+            pid = int(json.load(fh).get('pid') or 0)
+    except (OSError, ValueError, TypeError):
+        return None
+    return pid or None
+
 def logfile(root, name):
     return os.path.join(root, 'logs', name + '.log')
 
@@ -623,6 +673,20 @@ def cmd_start(root, name, spec, conf, wait_start=2.0):
     if existing:
         print('%s: already running (pid %d)' % (name, existing['pid']))
         return 0
+    # A previous instance that died without cleanup (SIGKILL from the OOM killer, a frozen
+    # Termux, kill -9) leaves its tracees running -- in its session, not its process group,
+    # and still holding the port, so the replacement dies with "Address already in use".
+    stale = recorded_pid(root, name)
+    if stale:
+        cleared = kill_session(stale)
+        if cleared:
+            print('%s: cleared %d process(es) left by a dead instance (pid %d)'
+                  % (name, len(cleared), stale))
+            time.sleep(0.3)
+    leftovers = kill_orphans(spec)
+    if leftovers:
+        print('%s: cleaned up %d orphan process(es) from a previous run'
+              % (name, len(leftovers)))
     argv, env, fake_id = build(root, spec, conf)
     os.makedirs(os.path.join(root, 'logs'), exist_ok=True)
     os.makedirs(os.path.join(root, 'run'), exist_ok=True)
@@ -718,6 +782,8 @@ def cmd_stop(root, name, timeout=20.0, spec=None):
         except OSError:
             pass
         time.sleep(0.5)
+    # tracees live in proot's session, not necessarily in its process group
+    kill_session(pid, timeout=2.0)
     path = pidfile(root, name)
     if os.path.exists(path):
         os.unlink(path)
