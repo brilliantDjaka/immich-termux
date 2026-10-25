@@ -1,0 +1,17 @@
+# downloaded layer cache (can be pruned with `immich prune`)
+cache/
+# extracted OCI rootfs per service
+rootfs/
+# pid files, generated /etc/hosts + resolv.conf fragments
+run/
+logs/
+# compose named volumes (e.g. model-cache) and the shared /dev/shm stand-in
+volumes/
+tmp/
+# generated plan
+plan.json
+# local configuration (may contain your own overrides)
+immich.conf
+# shm shim build output (the aarch64 binary is committed under lib/prebuilt/)
+shm/libshm-compat.so
+shm/shm_test

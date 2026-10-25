@@ -1,0 +1,49 @@
+# immich-termux configuration -- sourced by ./immich
+# Every value here can also be overridden with an environment variable of the same name.
+
+# Machine learning service (needs ~2 GB RAM extra; Android phones usually cannot afford it)
+# 0 = skip the immich-machine-learning container, 1 = run it
+WITH_ML=0
+
+# OCI platform to pull. arm64 for essentially every modern Android device.
+ARCH=arm64
+
+# Resolvers written into each container's /etc/resolv.conf (Android's netd resolver is
+# not visible to glibc inside proot, so these must be plain nameservers).
+DNS_SERVERS="1.1.1.1 8.8.8.8 9.9.9.9"
+
+# Cap the Node.js heap so the API server cannot push the device into swap death.
+NODE_HEAP_MB=768
+
+# Interface the Immich API/ML listens on. 0.0.0.0 = reachable from your LAN.
+IMMICH_BIND_HOST=0.0.0.0
+
+# Timezone written to /etc/localtime inside every rootfs (needs `pip install tzdata`).
+# The compose file's TZ is used when this is empty.
+TZ=
+
+# Postgres tuning for low-RAM devices: regenerates /etc/postgresql/postgresql.conf
+# inside the database rootfs with 192MB shared_buffers instead of 512MB.
+PG_LOW_MEM=1
+
+# Extensions PostgreSQL preloads. Immich v3 uses VectorChord; pgvecto.rs (vectors.so)
+# is also shipped in the image but crashes on Android, so it is not preloaded here.
+# Only change this if you know your database needs the other one.
+PG_PRELOAD=vchord.so
+
+# Emulate System V shared memory (shmget & friends), which Android's seccomp policy
+# kills with SIGSYS. PostgreSQL cannot start on Android without this.
+SHM_COMPAT=1
+
+# Debug helpers (leave unset normally)
+# PG_LOG_STATEMENT=all      # log every SQL statement (very verbose, slows things down)
+# RUST_BACKTRACE=1          # print extension panics as Rust backtraces
+
+# Seconds to wait for a service to become healthy during `immich up`.
+HEALTH_TIMEOUT=180
+
+# Override if proot lives somewhere unusual.
+# PROOT_BIN=proot
+
+# Set to 1 when proot's seccomp acceleration misbehaves on your kernel.
+# PROOT_NO_SECCOMP=1

@@ -1,0 +1,552 @@
+#!/bin/sh
+#- Termux has no /usr/bin/env and /bin/sh is Android's mksh, so re-exec under bash.
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+#
+# immich -- run the Immich docker-compose stack on Android/Termux without Docker.
+#
+# Android denies unprivileged namespaces, so Docker/Podman cannot exist here. This
+# launcher instead uses proot (ptrace, no namespaces) to run the *official* arm64 OCI
+# images from docker-compose.yaml, sharing Termux's network namespace so the services
+# talk over 127.0.0.1 exactly like they would on a compose bridge network.
+#
+# Usage: immich <command> [args]
+#   install [--with-ml]   bootstrap: deps, plan, pull images, timezone
+#   plan                  parse docker-compose.yaml -> run/*.json
+#   pull [svc...] [--force]
+#   up [svc...]           start (ml only with --with-ml / WITH_ML=1)
+#   down                  stop everything (reverse order)
+#   restart [svc...]
+#   status                table of services
+#   supervise             keep the stack running (restarts dead services)
+#   logs <svc> [lines]    show log; `-f` follows
+#   shell <svc>           interactive shell in the service rootfs
+#   exec <svc> -- cmd...  run a command inside the service rootfs
+#   env <svc>             resolved container environment
+#   url [svc]             print service URL
+#   doctor                diagnostics
+#   prune                 delete the downloaded layer cache
+#   version
+#
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="${IMMICH_TERMUX_ROOT:-$SELF_DIR}"
+COMPOSE="${COMPOSE_FILE:-$ROOT/docker-compose.yaml}"
+CONF_FILE="$ROOT/immich.conf"
+PY="${IMMICH_PYTHON:-python3}"
+
+if [ -f "$CONF_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$CONF_FILE"
+fi
+
+: "${WITH_ML:=0}"
+: "${ARCH:=arm64}"
+: "${DNS_SERVERS:=1.1.1.1 8.8.8.8 9.9.9.9}"
+: "${NODE_HEAP_MB:=768}"
+: "${IMMICH_BIND_HOST:=0.0.0.0}"
+: "${TZ:=}"
+: "${PG_LOW_MEM:=1}"
+: "${HEALTH_TIMEOUT:=180}"
+
+export IMMICH_TERMUX_ROOT="$ROOT"
+
+C_RED='\033[31m'; C_GRN='\033[32m'; C_YEL='\033[33m'; C_DIM='\033[2m'; C_OFF='\033[0m'
+[ -t 1 ] || { C_RED=''; C_GRN=''; C_YEL=''; C_DIM=''; C_OFF=''; }
+
+info()  { printf '%s\n' "$*"; }
+warn()  { printf "${C_YEL}warn:${C_OFF} %s\n" "$*" >&2; }
+err()   { printf "${C_RED}error:${C_OFF} %s\n" "$*" >&2; }
+dim()   { printf "${C_DIM}%s${C_OFF}\n" "$*"; }
+ok()    { printf "${C_GRN}%s${C_OFF}\n" "$*"; }
+
+ORDER_FILE="$ROOT/run/order"
+
+ensure_plan() {
+  local plan="$ROOT/plan.json"
+  if [ ! -f "$ORDER_FILE" ] || [ ! -f "$plan" ] \
+     || [ "$COMPOSE" -nt "$plan" ] || [ "$ROOT/lib/compose2plan.py" -nt "$plan" ]; then
+    cmd_plan >/dev/null || return 1
+  fi
+  return 0
+}
+
+service_list() {
+  if [ -f "$ORDER_FILE" ]; then
+    cat "$ORDER_FILE"
+  else
+    err "no plan yet -- run: immich plan"
+    return 1
+  fi
+}
+
+svc_spec()      { printf '%s/run/%s.json' "$ROOT" "$1"; }
+svc_field()     { "$PY" -c 'import json,sys;print(json.load(open(sys.argv[1])).get(sys.argv[2]) or "")' "$(svc_spec "$1")" "$2"; }
+svc_role()      { svc_field "$1" role; }
+svc_image()     { svc_field "$1" image; }
+svc_port()      { "$PY" -c 'import json,sys
+s=json.load(open(sys.argv[1]));p=s.get("ports") or []
+print(p[0]["container"] if p else (s.get("default_port") or ""))' "$(svc_spec "$1")"; }
+svc_hostport()  { "$PY" -c 'import json,sys
+s=json.load(open(sys.argv[1]));p=s.get("ports") or []
+print((p[0]["host"] if p else (s.get("default_port") or "")))' "$(svc_spec "$1")"; }
+svc_depends()   { "$PY" -c 'import json,sys
+print(" ".join(json.load(open(sys.argv[1])).get("depends_on") or []))' "$(svc_spec "$1")"; }
+
+enabled_services() {
+  local svc
+  for svc in $(service_list); do
+    if [ "$(svc_role "$svc")" = "ml" ] && [ "$WITH_ML" != "1" ]; then
+      continue
+    fi
+    printf '%s\n' "$svc"
+  done
+}
+
+require_python() {
+  if ! command -v "$PY" >/dev/null 2>&1; then
+    err "python3 not found. Install it with: pkg install python"
+    exit 1
+  fi
+}
+
+cmd_version() {
+  local ver="0.1.0"
+  local compose_ver="$(svc_field immich-server image 2>/dev/null || true)"
+  info "immich-termux $ver  (dockerless compose runner for Android/Termux)"
+  [ -n "$compose_ver" ] && dim "compose image: $compose_ver"
+}
+
+cmd_plan() {
+  require_python
+  "$PY" "$ROOT/lib/compose2plan.py" --compose "$COMPOSE" --root "$ROOT" --arch "$ARCH"
+}
+
+pull_args() {
+  local args=("--root" "$ROOT" "--arch" "$ARCH")
+  local force=0 svc
+  for svc in "$@"; do
+    case "$svc" in
+      --force) force=1 ;;
+      --*)
+        ;;
+      *) args+=("--spec" "run/$svc.json") ;;
+    esac
+  done
+  [ "$force" = 1 ] && args+=("--force")
+  if [ "${#args[@]}" = 3 ]; then
+    args+=("--all")
+  fi
+  "$PY" "$ROOT/lib/oci_pull.py" "${args[@]}"
+}
+
+cmd_pull() {
+  require_python
+  ensure_plan || return 1
+  pull_args "$@"
+}
+
+cmd_install() {
+  local with_ml=0 arg
+  for arg in "$@"; do
+    [ "$arg" = "--with-ml" ] && with_ml=1
+  done
+
+  info "==> checking Termux dependencies"
+  local missing=()
+  command -v proot   >/dev/null 2>&1 || missing+=(proot)
+  command -v "$PY"   >/dev/null 2>&1 || missing+=(python)
+  command -v tar     >/dev/null 2>&1 || missing+=(tar)
+  command -v curl    >/dev/null 2>&1 || missing+=(curl)
+  if [ "${#missing[@]}" -gt 0 ]; then
+    info "    installing: ${missing[*]}"
+    pkg install -y "${missing[@]}" || { err "pkg install failed"; return 1; }
+  else
+    dim "    proot, python, tar, curl present"
+  fi
+
+  mkdir -p "$ROOT"/{rootfs,run,logs,volumes,cache/blobs,tmp}
+
+  info "==> translating $COMPOSE"
+  cmd_plan || return 1
+
+  info "==> pulling images (anonymous OCI pull, no docker)"
+  if [ "$WITH_ML" = 1 ]; then
+    pull_args --all || return 1
+  else
+    # machine learning is skipped by default: it needs ~2 GB extra RAM. Pull it later
+    # with: immich pull immich-machine-learning
+    pull_args $(enabled_services) || return 1
+  fi
+
+  info "==> Android SysV shared memory shim"
+  if [ -f "$ROOT/shm/libshm-compat.so" ]; then
+    dim "    using shm/libshm-compat.so"
+  elif command -v clang >/dev/null 2>&1; then
+    if (cd "$ROOT/shm" && clang -shared -fPIC -nostdlib -nodefaultlibs -nostartfiles -O2 \
+          -Wl,-soname,libshm-compat.so -o libshm-compat.so shm_compat.c) 2>/dev/null; then
+      dim "    built shm/libshm-compat.so from source"
+    else
+      warn "shim build failed; falling back to the bundled binary"
+    fi
+  fi
+  if [ ! -f "$ROOT/shm/libshm-compat.so" ] && [ ! -f "$ROOT/lib/prebuilt/arm64/libshm-compat.so" ]; then
+    warn "no SysV shared memory shim found -- PostgreSQL cannot start without it"
+    warn "install clang (pkg install clang) and re-run, or drop an aarch64 build into"
+    warn "$ROOT/lib/prebuilt/arm64/libshm-compat.so"
+  fi
+
+  info "==> container timezone"
+  local tz="$TZ"
+  [ -z "$tz" ] && tz="$("$PY" -c 'import json,sys
+s=json.load(open(sys.argv[1]));print(s["services"].get("immich-server",{}).get("env",{}).get("TZ",""))' "$ROOT/plan.json")"
+  if [ -n "$tz" ]; then
+    "$PY" -c 'import tzdata' >/dev/null 2>&1 || {
+      dim "    installing python tzdata (for /etc/localtime)"
+      "$PY" -m pip install --quiet --disable-pip-version-check tzdata 2>/dev/null || warn "pip install tzdata failed; containers will use UTC"
+    }
+    "$PY" "$ROOT/lib/tzsetup.py" --root "$ROOT" --tz "$tz" || warn "timezone setup incomplete"
+  fi
+
+  if [ "$with_ml" = 1 ]; then
+    printf '\nWITH_ML=1\n' >> "$CONF_FILE"
+    info "==> machine learning enabled in immich.conf"
+  fi
+
+  ok "==> install complete"
+  info ""
+  info "Start the stack:   ./immich up"
+  info "Show status:       ./immich status"
+  info "Web UI:            http://127.0.0.1:$(svc_port immich-server 2>/dev/null || echo 2283)"
+  info ""
+  warn "Android may freeze Termux in the background. Run 'termux-wake-lock' (termux-api)"
+  warn "and disable battery optimisation for Termux, otherwise the stack will be paused."
+}
+
+service_healthy() {
+  local svc="$1" role port
+  role="$(svc_role "$svc")"
+  port="$(svc_port "$svc")"
+  if [ -z "$port" ]; then
+    err "$svc has no port to probe; re-run: immich plan"
+    return 1
+  fi
+  case "$role" in
+    database)
+      "$PY" "$ROOT/lib/probe.py" wait-tcp 127.0.0.1 "$port" --timeout "$HEALTH_TIMEOUT" --interval 1
+      ;;
+    redis)
+      "$PY" "$ROOT/lib/probe.py" redis 127.0.0.1 "$port"
+      ;;
+    server)
+      "$PY" "$ROOT/lib/probe.py" http "http://127.0.0.1:$port/api/server/ping" --contains pong --timeout 5
+      ;;
+    ml)
+      "$PY" "$ROOT/lib/probe.py" http "http://127.0.0.1:$port/ping" --contains pong --timeout 5
+      ;;
+    *)
+      "$PY" "$ROOT/lib/probe.py" tcp 127.0.0.1 "$port"
+      ;;
+  esac
+}
+
+wait_healthy() {
+  local svc="$1" tries=0 max=$(( HEALTH_TIMEOUT ))
+  while [ "$tries" -lt "$max" ]; do
+    if service_healthy "$svc"; then
+      return 0
+    fi
+    tries=$(( tries + 1 ))
+    sleep 1
+  done
+  return 1
+}
+
+cmd_up() {
+  require_python
+  ensure_plan || return 1
+
+  local explicit=("$@")
+  local svc started=0
+  local list
+
+  # a cold start gets a clean /dev/shm, like a fresh container does
+  local any_running=0 state
+  for svc in $(enabled_services); do
+    read -r state _ _ <<<"$(svc_state "$svc")"
+    [ "$state" = running ] && any_running=1
+  done
+  if [ "$any_running" = 0 ]; then
+    local cleared
+    cleared="$("$PY" "$ROOT/lib/svc.py" --root "$ROOT" clear-shm)"
+    [ "${cleared:-0}" -gt 0 ] && dim "cleared /dev/shm (${cleared} stale entries)"
+  fi
+
+  if [ "${#explicit[@]}" -gt 0 ]; then
+    list="${explicit[*]}"
+  else
+    list="$(enabled_services)"
+  fi
+
+  for svc in $list; do
+    if [ ! -f "$(svc_spec "$svc")" ]; then
+      err "unknown service: $svc"; return 1
+    fi
+    info "==> $svc"
+    "$PY" "$ROOT/lib/svc.py" --root "$ROOT" start "$svc" || return 1
+    if ! wait_healthy "$svc"; then
+      err "$svc did not become healthy within ${HEALTH_TIMEOUT}s"
+      dim "    last log lines from logs/$svc.log:"
+      tail -n 30 "$ROOT/logs/$svc.log" 2>/dev/null | sed 's/^/    /'
+      return 1
+    fi
+    ok "    $svc healthy"
+    started=$(( started + 1 ))
+  done
+
+  info ""
+  ok "$started service(s) running"
+  local url
+  url="$(cmd_url immich-server 2>/dev/null || true)"
+  [ -n "$url" ] && info "Web UI: $url"
+}
+
+cmd_down() {
+  require_python
+  local svc list
+  list="$(service_list 2>/dev/null | tac)"
+  for svc in $list; do
+    "$PY" "$ROOT/lib/svc.py" --root "$ROOT" stop "$svc" >/dev/null
+  done
+  ok "stopped"
+}
+
+cmd_restart() {
+  require_python
+  local svc
+  if [ "${#}" -gt 0 ]; then
+    for svc in "$@"; do
+      "$PY" "$ROOT/lib/svc.py" --root "$ROOT" stop "$svc" >/dev/null
+    done
+  else
+    cmd_down
+  fi
+  cmd_up "$@"
+}
+
+cmd_supervise() {
+  require_python
+  ensure_plan || return 1
+  local interval="${SUPERVISE_INTERVAL:-10}" svc state pid uptime
+  trap 'info ""; info "stopping supervisor"; cmd_down; exit 0' INT TERM
+  info "supervising the stack (interval ${interval}s, Ctrl-C to stop)"
+  while :; do
+    for svc in $(enabled_services); do
+      read -r state pid uptime <<<"$(svc_state "$svc")"
+      if [ "$state" != running ]; then
+        warn "$svc is not running -- restarting"
+        "$PY" "$ROOT/lib/svc.py" --root "$ROOT" start "$svc" >/dev/null \
+          && dim "    $svc restarted" || warn "    $svc restart failed"
+      fi
+    done
+    sleep "$interval"
+  done
+}
+
+svc_state() {
+  "$PY" "$ROOT/lib/svc.py" --root "$ROOT" status "$1" 2>/dev/null |
+    "$PY" -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: d={}
+print("running" if d.get("running") else "stopped", d.get("pid",""), d.get("uptime_s",""))'
+}
+
+human_uptime() {
+  local s="$1"
+  if [ -z "$s" ]; then printf -- '-'; return; fi
+  printf '%02dh%02dm%02ds' $(( s / 3600 )) $(( (s % 3600) / 60 )) $(( s % 60 ))
+}
+
+cmd_status() {
+  require_python
+  ensure_plan || return 1
+  printf '%-22s %-9s %-8s %-10s %-7s %-6s %s\n' SERVICE STATE PID UPTIME PORT HEALTH IMAGE
+  local svc state pid uptime port health image mark
+  for svc in $(service_list); do
+    read -r state pid uptime <<<"$(svc_state "$svc")"
+    uptime="$(human_uptime "$uptime")"
+    port="$(svc_port "$svc")"
+    image="$(svc_image "$svc" | sed 's#.*/##')"
+    if [ "$state" = running ]; then
+      if [ "$(svc_role "$svc")" = ml ] && [ "$WITH_ML" != 1 ]; then
+        health="off"
+      elif service_healthy "$svc"; then
+        health="${C_GRN}ok${C_OFF}"
+      else
+        health="${C_RED}fail${C_OFF}"
+      fi
+      mark="${C_GRN}running${C_OFF}"
+    else
+      health="-"
+      mark=stopped
+    fi
+    printf '%-22s %-9b %-8s %-10s %-7s %-6b %s\n' "$svc" "$mark" "${pid:--}" "$uptime" "${port:--}" "$health" "$image"
+  done
+}
+
+cmd_logs() {
+  local svc="${1:-}" lines="${2:-40}"
+  [ -z "$svc" ] && { err "usage: immich logs <service> [lines]"; return 1; }
+  local log="$ROOT/logs/$svc.log"
+  [ -f "$log" ] || { err "no log for $svc ($log)"; return 1; }
+  if [ "$lines" = "-f" ]; then
+    tail -n 40 -f "$log"
+  else
+    tail -n "$lines" "$log"
+  fi
+}
+
+cmd_shell() {
+  require_python
+  local svc="${1:-}"
+  [ -z "$svc" ] && { err "usage: immich shell <service>"; return 1; }
+  "$PY" "$ROOT/lib/svc.py" --root "$ROOT" shell "$svc"
+}
+
+cmd_exec() {
+  require_python
+  local svc="${1:-}"; shift || true
+  [ -z "$svc" ] && { err "usage: immich exec <service> -- command"; return 1; }
+  "$PY" "$ROOT/lib/svc.py" --root "$ROOT" exec "$svc" -- "$@"
+}
+
+cmd_env() {
+  require_python
+  local svc="${1:-}"
+  [ -z "$svc" ] && { err "usage: immich env <service>"; return 1; }
+  "$PY" "$ROOT/lib/svc.py" --root "$ROOT" env "$svc"
+}
+
+cmd_url() {
+  local svc="${1:-immich-server}" port host
+  port="$(svc_port "$svc")"; host="$IMMICH_BIND_HOST"
+  [ -z "$port" ] && return 1
+  if [ "$host" = "0.0.0.0" ]; then
+    printf 'http://%s:%s\n' "$(ip_guess)" "$port"
+  else
+    printf 'http://%s:%s\n' "$host" "$port"
+  fi
+}
+
+ip_guess() {
+  "$PY" - <<'PY'
+import socket
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.connect(('1.1.1.1', 80))
+    print(s.getsockname()[0])
+    s.close()
+except OSError:
+    print('127.0.0.1')
+PY
+}
+
+cmd_doctor() {
+  require_python
+  ensure_plan >/dev/null 2>&1 || true
+  info "== device =="
+  uname -srm | sed 's/^/  /'
+  dim "  proot        : $(proot --version 2>&1 | tr -d '\r' | grep -iE '^proot ' | head -1)"
+  dim "  python       : $($PY -V 2>&1)"
+  dim "  cores        : $(nproc 2>/dev/null || echo '?')"
+  local shim
+  shim="$ROOT/shm/libshm-compat.so"
+  [ -f "$shim" ] || shim="$ROOT/lib/prebuilt/arm64/libshm-compat.so"
+  dim "  sysv shim    : ${shim#$ROOT/}"
+  if [ -r /proc/meminfo ]; then
+    awk '/MemTotal|MemAvailable|SwapTotal|SwapFree/{k=$1; sub(/:$/,"",k); printf "  %-13s: %.2f GiB\n", k, $2/1048576}' /proc/meminfo
+  fi
+  df -h "$ROOT" | tail -1 | awk '{printf "  storage      : %s free of %s\n", $4, $2}'
+
+  info ""
+  info "== kernel capability =="
+  if unshare -m true 2>/dev/null; then
+    dim "  unshare -m   : allowed (a container runtime might work)"
+  else
+    dim "  unshare -m   : denied -> docker/podman impossible, proot used instead"
+  fi
+
+  info ""
+  info "== plan =="
+  if [ -f "$ORDER_FILE" ]; then
+    local svc
+    for svc in $(service_list); do
+      local rootfs image digest size
+      rootfs="$ROOT/rootfs/$svc"
+      image="$(svc_image "$svc")"
+      if [ -d "$rootfs" ]; then
+        size="$(du -sh "$rootfs" 2>/dev/null | cut -f1)"
+        digest="$("$PY" -c 'import json,sys
+try: print((json.load(open(sys.argv[1])).get("config_digest") or "")[:19])
+except Exception: print("")' "$rootfs/.immich-image.json" 2>/dev/null || true)"
+      else
+        size="-"; digest="-"
+      fi
+      printf '  %-22s %-8s %-8s %s\n' "$svc" "${size:--}" "${digest:--}" "$image"
+    done
+  else
+    warn "  no plan -- run: immich plan"
+  fi
+
+  info ""
+  info "== configured ports =="
+  local svc uid_line
+  for svc in $(service_list 2>/dev/null); do
+    local port state
+    port="$(svc_port "$svc")"
+    if "$PY" "$ROOT/lib/probe.py" tcp 127.0.0.1 "$port"; then state=busy; else state=free; fi
+    printf '  %-22s %-6s %s\n' "$svc" "$port" "$state"
+  done
+
+  info ""
+  info "== settings =="
+  dim "  root         : $ROOT"
+  dim "  compose      : $COMPOSE"
+  dim "  WITH_ML      : $WITH_ML"
+  dim "  DNS_SERVERS  : $DNS_SERVERS"
+  dim "  NODE_HEAP_MB : $NODE_HEAP_MB"
+  dim "  PG_LOW_MEM   : $PG_LOW_MEM"
+  [ -f "$CONF_FILE" ] && dim "  immich.conf  : $CONF_FILE"
+}
+
+cmd_prune() {
+  local size
+  size="$(du -sh "$ROOT/cache" 2>/dev/null | cut -f1)"
+  rm -rf "$ROOT"/cache/blobs/*
+  ok "pruned layer cache (${size:-0} freed). Rootfs directories are kept."
+}
+
+usage() {
+  grep -E '^# ' "$0" | sed 's/^# \{0,1\}//' | sed -n '1,40p'
+}
+
+case "${1:-help}" in
+  install)  shift; cmd_install "$@" ;;
+  plan)     shift; cmd_plan "$@" ;;
+  pull)     shift; cmd_pull "$@" ;;
+  up)       shift; cmd_up "$@" ;;
+  down)     shift; cmd_down "$@" ;;
+  restart)  shift; cmd_restart "$@" ;;
+  status|ps) shift; cmd_status "$@" ;;
+  supervise|watch) shift; cmd_supervise "$@" ;;
+  logs)     shift; cmd_logs "$@" ;;
+  shell)    shift; cmd_shell "$@" ;;
+  exec)     shift; cmd_exec "$@" ;;
+  env)      shift; cmd_env "$@" ;;
+  url)      shift; cmd_url "$@" ;;
+  doctor)   shift; cmd_doctor "$@" ;;
+  prune)    shift; cmd_prune "$@" ;;
+  version|--version) cmd_version ;;
+  help|-h|--help) usage ;;
+  *) err "unknown command: $1"; info ""; usage; exit 1 ;;
+esac
